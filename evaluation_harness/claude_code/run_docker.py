@@ -29,6 +29,14 @@ ALLOWED_TOOLS = [
     "TodoRead",
     "TodoWrite",
     "Agent",
+    "Skill",
+    "Task",
+    "mcp__security-agent__*",
+]
+
+#: The Security Agent's setup tool creates AWS resources, which no run may do.
+DISALLOWED_TOOLS = [
+    "mcp__security-agent__setup",
 ]
 
 #: Host env vars passed to the agent; names listed in BENCH_FORWARD_ENV
@@ -62,6 +70,16 @@ def get_agent_env(environ: Mapping[str, str] = os.environ) -> dict[str, str]:
     env = {name: environ[name] for name in [*AGENT_ENV_NAMES, *extra] if environ.get(name)}
     env.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "50000")
     return env
+
+
+def claude_tool_flags(allowed_tools: list[str], disallowed_tools: list[str]) -> str:
+    """The ``--allowedTools`` and ``--disallowedTools`` arguments, each tool shell-quoted."""
+    flags = []
+    if allowed_tools:
+        flags.append("--allowedTools " + " ".join(map(shlex.quote, allowed_tools)))
+    if disallowed_tools:
+        flags.append("--disallowedTools " + " ".join(map(shlex.quote, disallowed_tools)))
+    return " ".join(flags)
 
 
 class DockerIntegration(DockerHarnessBase):
@@ -102,7 +120,7 @@ def main():
         print(f"🔧 Task: {TASK}")
         claude_command = (
             "claude --verbose --output-format stream-json "
-            f"-p {escaped_instruction} --allowedTools {' '.join(ALLOWED_TOOLS)}"
+            f"-p {escaped_instruction} {claude_tool_flags(ALLOWED_TOOLS, DISALLOWED_TOOLS)}"
         )
 
         result = integration.execute_in_container(claude_command, env=get_agent_env())

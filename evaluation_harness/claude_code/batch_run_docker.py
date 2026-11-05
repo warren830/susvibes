@@ -18,7 +18,7 @@ import argparse
 import shlex
 
 # Import the Docker integration classes
-from run_docker import DockerIntegration, USER_PROMPT_TEMPLATE, ALLOWED_TOOLS, get_agent_env
+from run_docker import DockerIntegration, USER_PROMPT_TEMPLATE, ALLOWED_TOOLS, DISALLOWED_TOOLS, claude_tool_flags, get_agent_env
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -47,11 +47,18 @@ def get_options():
     parser.add_argument('--setup_script', type=str, default="setup-env.sh", help='Setup script to run in container')
     parser.add_argument('--setup_assets', type=str, default=None, help='Host directory copied to /opt/bench-assets in the container before the setup script runs; the script sees it as BENCH_ASSETS')
     parser.add_argument('--claude_code_version', type=str, default=None, help="Claude Code version the setup script installs, passed to it as CLAUDE_CODE_VERSION (default: the script's own)")
+    parser.add_argument('--allowed_tools', type=str, default=','.join(ALLOWED_TOOLS), help='Comma-separated tools Claude may use without asking')
+    parser.add_argument('--disallowed_tools', type=str, default=','.join(DISALLOWED_TOOLS), help='Comma-separated tools Claude may not use')
     parser.add_argument('--timestamp_suffix', type=str, default=None, help='Suffix to append to timestamp for unique directory names (for parallel runs)')
     parser.add_argument('--keep_workspace', action='store_true', default=False, help='Whether to keep the workspace after cleanup')
     parser.add_argument('--strategy', type=str, default='none', choices=['none', 'generic'],
                         help='Safety strategy applied to the problem statement (none = no hint)')
     return parser
+
+
+def split_tools(value: str) -> List[str]:
+    """Tool names from a comma-separated option value."""
+    return [tool.strip() for tool in value.split(',') if tool.strip()]
 
 
 def simple_git_diff(dirpath: str) -> str:
@@ -116,6 +123,8 @@ async def process_instance(
     strategy: str = "none",
     setup_assets: Optional[str] = None,
     claude_code_version: Optional[str] = None,
+    allowed_tools: List[str] = ALLOWED_TOOLS,
+    disallowed_tools: List[str] = DISALLOWED_TOOLS,
 ) -> Dict[str, Any]:
     """
     Process a single instance with Docker-based Claude execution.
@@ -129,6 +138,8 @@ async def process_instance(
         setup_script: Setup script to run in container
         setup_assets: Host directory the setup script gets as BENCH_ASSETS
         claude_code_version: Claude Code version the setup script installs
+        allowed_tools: Tools Claude may use without asking
+        disallowed_tools: Tools Claude may not use
 
     Returns:
         Result dictionary with instance_id, model, and model_patch
@@ -193,9 +204,10 @@ async def process_instance(
 
             # Run Claude with the problem statement
             logger.info(f"Running Claude for {instance_id}")
+            tool_flags = claude_tool_flags(allowed_tools, disallowed_tools)
             claude_command = (
                 "claude --verbose --output-format stream-json "
-                f"-p {escaped_instruction} --allowedTools {' '.join(ALLOWED_TOOLS)}"
+                f"-p {escaped_instruction} {tool_flags}"
             )
             
             result = integration.execute_in_container(claude_command, env=env)
@@ -291,6 +303,8 @@ async def main(args):
                 strategy=args.strategy,
                 setup_assets=args.setup_assets,
                 claude_code_version=args.claude_code_version,
+                allowed_tools=split_tools(args.allowed_tools),
+                disallowed_tools=split_tools(args.disallowed_tools),
             )
             
             # Save intermediate results every instance

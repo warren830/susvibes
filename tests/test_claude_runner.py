@@ -146,3 +146,54 @@ def test_failed_setup_fails_the_instance_without_running_claude(batch, tmp_path)
     assert record["model_patch"] == ""
     assert "Environment setup failed" in record["error"]
     assert not any("claude --verbose" in script for script in docker.scripts())
+
+
+# ── claude command ────────────────────────────────────────────────────
+
+UPSTREAM_TOOLS = [
+    "Bash", "Edit", "Write", "Read", "Glob", "Grep", "LS", "WebFetch",
+    "NotebookEdit", "NotebookRead", "TodoRead", "TodoWrite", "Agent",
+]
+
+
+def claude_args(docker, tmp_path):
+    """The argv bash hands to ``claude``, run in a dir where an unquoted glob would expand."""
+    (script,) = [s for s in docker.scripts() if "claude --verbose" in s]
+    command = script[script.index("claude --verbose"):]
+    shell_dir = tmp_path / "shell"
+    shell_dir.mkdir()
+    (shell_dir / "mcp__security-agent__decoy").touch()
+    out = subprocess.run(
+        ["bash", "-c", 'claude() { printf "%s\\0" "$@"; }\n' + command],
+        cwd=shell_dir, capture_output=True, text=True, check=True,
+    ).stdout
+    return out.split("\0")[:-1]
+
+
+def test_claude_gets_default_tool_lists(batch, tmp_path):
+    docker = FakeDocker()
+
+    run_instance(batch, tmp_path, docker)
+
+    args = claude_args(docker, tmp_path)
+    allowed = args[args.index("--allowedTools") + 1:args.index("--disallowedTools")]
+    assert allowed == [*UPSTREAM_TOOLS, "Skill", "Task", "mcp__security-agent__*"]
+    assert args[args.index("--disallowedTools") + 1:] == ["mcp__security-agent__setup"]
+    assert INSTANCE["problem_statement"] in args[args.index("-p") + 1]
+
+
+def test_claude_gets_overridden_tool_lists(batch, tmp_path):
+    docker = FakeDocker()
+
+    run_instance(batch, tmp_path, docker, allowed_tools=["Bash", "Read"], disallowed_tools=[])
+
+    args = claude_args(docker, tmp_path)
+    assert args[args.index("--allowedTools") + 1:] == ["Bash", "Read"]
+    assert "--disallowedTools" not in args
+
+
+def test_tool_options_parse_as_comma_lists(batch):
+    args = batch.get_options().parse_args(["--allowed_tools", "Bash, Skill,,mcp__x__*", "--disallowed_tools", ""])
+
+    assert batch.split_tools(args.allowed_tools) == ["Bash", "Skill", "mcp__x__*"]
+    assert batch.split_tools(args.disallowed_tools) == []

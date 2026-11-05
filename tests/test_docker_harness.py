@@ -175,6 +175,56 @@ def test_execute_timeout_returns_failure():
     assert "timed out" in result["stderr"]
 
 
+# ── setup_cli_env ─────────────────────────────────────────────────────
+
+
+def test_setup_runs_script_from_any_host_path_with_assets_and_env(tmp_path, monkeypatch):
+    (tmp_path / "harness").mkdir()
+    (tmp_path / "arms" / "assets").mkdir(parents=True)
+    script = tmp_path / "arms" / "arm2.sh"
+    script.write_text("echo arm2\n")
+    script.chmod(0o644)
+    monkeypatch.chdir(tmp_path / "harness")
+    harness = _FooHarness("img:latest")
+    harness.workspace_container = "foo_work_123"
+
+    with mock.patch("evaluation_harness.base.subprocess.run") as run:
+        run.return_value = _fake_completed()
+        result = harness.setup_cli_env(
+            "../arms/arm2.sh",
+            env={"CLAUDE_CODE_VERSION": "2.1.318"},
+            assets_dir="../arms/assets",
+        )
+
+    assert result["success"] is True
+    commands = [call.args[0] for call in run.call_args_list]
+    copies = [cmd for cmd in commands if cmd[:2] == ["docker", "cp"]]
+    assert [cmd[2] for cmd in copies] == ["../arms/assets/.", "../arms/arm2.sh"]
+    script_in_container = copies[1][3].removeprefix("foo_work_123:")
+    assert not script_in_container.startswith(harness.container_work_dir)
+    setup_command = commands[-1][-1]
+    assert setup_command.rstrip().endswith(f"bash {script_in_container}")
+
+    (script_env,) = _stdin_sent(run)
+    assets_in_container = copies[0][3].removeprefix("foo_work_123:")
+    assert _source_in_bash(script_env, tmp_path, "CLAUDE_CODE_VERSION", "BENCH_ASSETS") == {
+        "CLAUDE_CODE_VERSION": "2.1.318",
+        "BENCH_ASSETS": assets_in_container,
+    }
+    assert script.stat().st_mode & 0o777 == 0o644
+
+
+def test_setup_fails_when_script_is_missing(tmp_path):
+    harness = _FooHarness("img:latest")
+    harness.workspace_container = "foo_work_123"
+
+    with mock.patch("evaluation_harness.base.subprocess.run") as run:
+        result = harness.setup_cli_env(str(tmp_path / "missing.sh"))
+
+    assert result["success"] is False
+    run.assert_not_called()
+
+
 def test_env_source_block_lists_all_files():
     harness = _FooHarness("img:latest")
     block = harness._env_source_block()

@@ -12,7 +12,7 @@ source "$HOME/.nvm/nvm.sh"
 nvm install 22
 npm -v
 
-npm install -g @anthropic-ai/claude-code@1.0.128
+npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:-1.0.128}"
 
 echo "Setting up environment..."
 cat > /root/.claude_env << 'EOF'

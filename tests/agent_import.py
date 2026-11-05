@@ -16,7 +16,7 @@ from pathlib import Path
 HARNESS_ROOT = Path(__file__).resolve().parent.parent / "evaluation_harness"
 
 # Modules that each agent directory defines as top-level names.
-_AGENT_LOCAL_MODULES = ("run_docker", "prompts")
+_AGENT_LOCAL_MODULES = ("run_docker", "prompts", "batch_run_docker", "parallel_batch_run")
 
 
 def import_agent_module(agent_dir: str, module_name: str = "run_docker"):

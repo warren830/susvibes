@@ -186,7 +186,12 @@ class DockerHarness(AgentHarness, Protocol):
         """Run a shell command inside the agent's Docker container."""
         ...
 
-    def setup_cli_env(self, setup_script_path: str | Path | None = None) -> None:
+    def setup_cli_env(
+        self,
+        setup_script_path: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+        assets_dir: str | None = None,
+    ) -> None:
         """Install the agent CLI inside the container."""
         ...
 
@@ -236,6 +241,11 @@ def normalize_prediction(
 #: Agent env vars as a shell file inside the container; every in-container
 #: command sources it after the subclass's ``env_source_files``.
 AGENT_ENV_FILE = "/root/.bench_agent_env"
+
+#: Where the setup script runs and where its assets land in the container;
+#: both stay outside the workspace the agent sees.
+SETUP_SCRIPT_PATH = "/opt/setup-env.sh"
+BENCH_ASSETS_DIR = "/opt/bench-assets"
 
 
 def agent_env_script(env: Mapping[str, str]) -> str:
@@ -461,8 +471,20 @@ class DockerHarnessBase:
                 "success": False,
             }
 
-    def setup_cli_env(self, setup_script_path: str = "setup-env.sh") -> dict:
-        """Copy and run the CLI setup script inside the container."""
+    def setup_cli_env(
+        self,
+        setup_script_path: str = "setup-env.sh",
+        env: Mapping[str, str] | None = None,
+        assets_dir: str | None = None,
+    ) -> dict:
+        """Copy and run the CLI setup script inside the container.
+
+        The script may be any host path; it runs as ``SETUP_SCRIPT_PATH``,
+        outside the workspace the agent sees, with ``env`` in its
+        environment.  ``assets_dir``, when given, is copied to
+        ``BENCH_ASSETS_DIR`` first and named to the script by
+        ``BENCH_ASSETS``.
+        """
         if not self.workspace_container:
             raise RuntimeError(
                 "No persistent container available. "
@@ -471,7 +493,7 @@ class DockerHarnessBase:
 
         print(f"🔧 Setting up environment using {setup_script_path}...")
 
-        setup_file = Path("./") / setup_script_path
+        setup_file = Path(setup_script_path)
         if not setup_file.exists():
             return {
                 "stdout": "",
@@ -481,18 +503,35 @@ class DockerHarnessBase:
                 "command": f"setup from {setup_script_path}",
             }
 
+        setup_env = dict(env or {})
         try:
-            container_setup_path = (
-                f"{self.container_work_dir}/{setup_script_path}"
-            )
-
-            subprocess.run(["chmod", "+x", str(setup_file)], check=True)
+            if assets_dir:
+                copy_assets = subprocess.run(
+                    [
+                        "docker", "cp",
+                        f"{assets_dir}/.",
+                        f"{self.workspace_container}:{BENCH_ASSETS_DIR}",
+                    ],
+                    capture_output=True, text=True,
+                )
+                if copy_assets.returncode != 0:
+                    return {
+                        "stdout": "",
+                        "stderr": (
+                            "Failed to copy setup assets to container: "
+                            f"{copy_assets.stderr}"
+                        ),
+                        "return_code": copy_assets.returncode,
+                        "success": False,
+                        "command": f"copy {assets_dir} to container",
+                    }
+                setup_env["BENCH_ASSETS"] = BENCH_ASSETS_DIR
 
             copy_result = subprocess.run(
                 [
                     "docker", "cp",
                     str(setup_file),
-                    f"{self.workspace_container}:{container_setup_path}",
+                    f"{self.workspace_container}:{SETUP_SCRIPT_PATH}",
                 ],
                 capture_output=True, text=True,
             )
@@ -509,18 +548,9 @@ class DockerHarnessBase:
                     "command": f"copy {setup_script_path} to container",
                 }
 
-            chmod_result = self.execute_in_container(
-                f"chmod +x {container_setup_path}"
-            )
-            if not chmod_result["success"]:
-                print(
-                    "⚠️  Warning: Could not make script executable: "
-                    f"{chmod_result['stderr']}"
-                )
-
             print("🚀 Running setup script...")
             setup_result = self.execute_in_container(
-                f"bash {container_setup_path}"
+                f"bash {SETUP_SCRIPT_PATH}", env=setup_env
             )
 
             if setup_result["success"]:
@@ -546,20 +576,6 @@ class DockerHarnessBase:
 
             return setup_result
 
-        except subprocess.CalledProcessError as e:
-            error_msg = (
-                "Docker command failed: "
-                f"{e.stderr if hasattr(e, 'stderr') else str(e)}"
-            )
-            print(f"❌ {error_msg}")
-            return {
-                "stdout": e.stdout if hasattr(e, "stdout") else "",
-                "stderr": error_msg,
-                "return_code": e.returncode,
-                "success": False,
-                "command": f"setup from {setup_script_path}",
-                "execution_time": 0,
-            }
         except Exception as e:
             error_msg = f"Setup failed: {str(e)}"
             print(f"❌ {error_msg}")

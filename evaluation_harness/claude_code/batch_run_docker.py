@@ -12,7 +12,7 @@ import subprocess
 import asyncio
 import time
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 import argparse
 import shlex
@@ -45,6 +45,8 @@ def get_options():
     parser.add_argument('--load_from_file', type=str, default=None, help='Path to the file to load from')
     parser.add_argument('--model', type=str, default="claude", help='Model to use')
     parser.add_argument('--setup_script', type=str, default="setup-env.sh", help='Setup script to run in container')
+    parser.add_argument('--setup_assets', type=str, default=None, help='Host directory copied to /opt/bench-assets in the container before the setup script runs; the script sees it as BENCH_ASSETS')
+    parser.add_argument('--claude_code_version', type=str, default=None, help="Claude Code version the setup script installs, passed to it as CLAUDE_CODE_VERSION (default: the script's own)")
     parser.add_argument('--timestamp_suffix', type=str, default=None, help='Suffix to append to timestamp for unique directory names (for parallel runs)')
     parser.add_argument('--keep_workspace', action='store_true', default=False, help='Whether to keep the workspace after cleanup')
     parser.add_argument('--strategy', type=str, default='none', choices=['none', 'generic'],
@@ -103,10 +105,21 @@ def load_instances(jsonl_file: str) -> List[Dict[str, Any]]:
         return []
 
 
-async def process_instance(instance: Dict[str, Any], index: int, total: int, model: str, workspace_root: str = ".", setup_script: str = "setup-env.sh", keep_workspace: bool = True, strategy: str = "none") -> Dict[str, Any]:
+async def process_instance(
+    instance: Dict[str, Any],
+    index: int,
+    total: int,
+    model: str,
+    workspace_root: str = ".",
+    setup_script: str = "setup-env.sh",
+    keep_workspace: bool = True,
+    strategy: str = "none",
+    setup_assets: Optional[str] = None,
+    claude_code_version: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Process a single instance with Docker-based Claude execution.
-    
+
     Args:
         instance: Instance dictionary from JSONL
         index: Current instance index (0-based)
@@ -114,7 +127,9 @@ async def process_instance(instance: Dict[str, Any], index: int, total: int, mod
         model: Model name
         workspace_root: Root directory for workspaces
         setup_script: Setup script to run in container
-        
+        setup_assets: Host directory the setup script gets as BENCH_ASSETS
+        claude_code_version: Claude Code version the setup script installs
+
     Returns:
         Result dictionary with instance_id, model, and model_patch
     """
@@ -162,13 +177,20 @@ async def process_instance(instance: Dict[str, Any], index: int, total: int, mod
             print(f"🔧 Setting up environment...")
             workspace = integration.setup_persistent_workspace()
 
-            setup_result = integration.setup_cli_env(setup_script_path=setup_script)
+            setup_env = {"CLAUDE_CODE_VERSION": claude_code_version} if claude_code_version else {}
+            setup_result = integration.setup_cli_env(setup_script_path=setup_script, env=setup_env, assets_dir=setup_assets)
 
-            # Set up environment
+            # Going on would run the agent on a half-installed setup, silently measuring another configuration
             if not setup_result["success"]:
-                logger.warning(f"Environment setup failed for {instance_id}: {setup_result['stderr']}")
-            
-            
+                logger.error(f"Environment setup failed for {instance_id}: {setup_result['stderr']}")
+                return {
+                    "instance_id": instance_id,
+                    "model_name_or_path": model,
+                    "model_patch": "",
+                    "error": f"Environment setup failed: {setup_result['stderr']}",
+                    "workspace": str(workspace)
+                }
+
             # Run Claude with the problem statement
             logger.info(f"Running Claude for {instance_id}")
             claude_command = (
@@ -267,6 +289,8 @@ async def main(args):
                 workspace_root=workspace_root, setup_script=setup_script,
                 keep_workspace=args.keep_workspace,
                 strategy=args.strategy,
+                setup_assets=args.setup_assets,
+                claude_code_version=args.claude_code_version,
             )
             
             # Save intermediate results every instance

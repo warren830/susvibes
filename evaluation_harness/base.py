@@ -637,6 +637,21 @@ class DockerHarnessBase:
                 "execution_time": 0,
             }
 
+    def stop_agent_processes(self) -> None:
+        """Kill every process left in the container except PID 1.
+
+        Killing a timed-out ``docker exec`` leaves its process running in
+        the container; stop it before taking the patch, so nothing still
+        edits the workspace or holds git's index lock.
+        """
+        subprocess.run(
+            [
+                "docker", "exec", self.workspace_container,
+                "bash", "-c", "kill -KILL -1",
+            ],
+            capture_output=True,
+        )
+
     def head_commit(self) -> str:
         """The commit the workspace is at, read inside the container."""
         result = subprocess.run(

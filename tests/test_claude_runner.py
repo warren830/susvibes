@@ -278,6 +278,12 @@ def test_timed_out_claude_run_is_recorded(batch, tmp_path):
     assert record["timed_out"] is True
     assert record["claude_success"] is False
     assert record["model_patch"] == PATCH
+    # The killed docker exec leaves claude running in the container; it is
+    # stopped before the patch is taken.
+    claude_run = docker.index(lambda argv: "claude --verbose" in argv[-1])
+    stop = docker.index(lambda argv: argv[:2] == ["docker", "exec"] and argv[-1].startswith("kill"))
+    git_add = docker.index(lambda argv: argv[:2] == ["docker", "exec"] and "add" in argv and "git" in argv)
+    assert claude_run < stop < git_add
 
 
 

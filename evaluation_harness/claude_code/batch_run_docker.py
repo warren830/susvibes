@@ -277,6 +277,7 @@ async def process_instance(
             print(f"📁 Your improved code is at: {workspace}")
             
             # Get git diff
+            integration.stop_agent_processes()
             diff_text = integration.extract_patch(base_commit)
             
             result_dict = {

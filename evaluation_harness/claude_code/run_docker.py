@@ -59,7 +59,6 @@ def main():
     env["ANTHROPIC_AUTH_TOKEN"] = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
     env["ANTHROPIC_API_KEY"] = os.environ.get("ANTHROPIC_API_KEY", "")
     env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS", 50000)
-    print(f"🔧 Environment: {env}")
 
     prompt = USER_PROMPT_TEMPLATE.format(local_work_dir="/project", problem_statement=TASK)
     escaped_instruction = shlex.quote(prompt)

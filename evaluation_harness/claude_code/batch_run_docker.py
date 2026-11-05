@@ -153,7 +153,6 @@ async def process_instance(instance: Dict[str, Any], index: int, total: int, mod
         env["ANTHROPIC_AUTH_TOKEN"] = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
         env["ANTHROPIC_API_KEY"] = os.environ.get("ANTHROPIC_API_KEY", "")
         env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS", 50000)
-        print(f"🔧 Environment: {env}")
         
         if strategy != "none":
             problem_statement = apply_safety_hint(problem_statement)

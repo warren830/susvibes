@@ -8,11 +8,13 @@ containers per-agent, and sources the right env files.
 
 from __future__ import annotations
 
+import os
+import subprocess
 from unittest import mock
 
 import pytest
 
-from evaluation_harness.base import DockerHarnessBase
+from evaluation_harness.base import AGENT_ENV_FILE, DockerHarnessBase
 from tests.agent_import import import_agent_module
 
 
@@ -27,6 +29,27 @@ class _FooHarness(DockerHarnessBase):
 
 def _fake_completed(stdout="out", stderr="err", returncode=0):
     return mock.MagicMock(stdout=stdout, stderr=stderr, returncode=returncode)
+
+
+def _stdin_sent(run) -> list[str]:
+    return [call.kwargs["input"] for call in run.call_args_list if "input" in call.kwargs]
+
+
+def _source_in_bash(script: str, tmp_path, *names: str) -> dict[str, str]:
+    """Source ``script`` in a clean bash and return the named vars it set."""
+    env_file = tmp_path / "agent_env"
+    env_file.write_text(script)
+    out = subprocess.run(
+        [
+            "bash", "-c",
+            'source "$1"; shift; for n in "$@"; do '
+            'if [ -n "${!n+set}" ]; then printf "%s=%s\\0" "$n" "${!n}"; fi; done',
+            "_", str(env_file), *names,
+        ],
+        capture_output=True, text=True, check=True,
+        env={"PATH": os.environ["PATH"]},
+    ).stdout
+    return dict(item.split("=", 1) for item in out.split("\0") if item)
 
 
 # ── setup_persistent_workspace / naming ───────────────────────────────
@@ -102,13 +125,39 @@ def test_execute_builds_command_and_sources_env():
     full_command = exec_cmd[-1]
     assert "source /root/.foo_env" in full_command
     assert "source /root/.nvm/nvm.sh" in full_command
-    assert "export KEY=val" in full_command
     assert full_command.rstrip().endswith("run-agent")
+    # The agent env file is sourced last, so its values override the others.
+    sourced = [line.split()[-1] for line in full_command.splitlines() if "source" in line]
+    assert sourced == [*harness.env_source_files, AGENT_ENV_FILE]
 
     assert result["success"] is True
     assert result["stdout"] == "hello"
     assert result["return_code"] == 0
     assert result["command"] == "run-agent"
+
+
+def test_env_values_stay_off_argv_and_stdout(tmp_path, capsys):
+    harness = _FooHarness("img:latest")
+    harness.workspace_container = "foo_work_123"
+    pwned = tmp_path / "pwned"
+    secret = f"sk-ant 'quoted' $(touch {pwned}) `touch {pwned}`"
+
+    with mock.patch("evaluation_harness.base.subprocess.run") as run:
+        run.return_value = _fake_completed()
+        harness.execute_in_container(
+            "run-agent", env={"ANTHROPIC_API_KEY": secret, "ANTHROPIC_MODEL": ""}
+        )
+
+    for call in run.call_args_list:
+        assert not any(secret in arg for arg in call.args[0])
+    assert secret not in capsys.readouterr().out
+
+    # The value reaches the container only over stdin, intact and inert;
+    # the empty one is not exported, so it cannot mask a setup default.
+    (script,) = _stdin_sent(run)
+    exported = _source_in_bash(script, tmp_path, "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL")
+    assert exported == {"ANTHROPIC_API_KEY": secret}
+    assert not pwned.exists()
 
 
 def test_execute_timeout_returns_failure():

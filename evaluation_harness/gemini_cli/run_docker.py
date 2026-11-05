@@ -57,8 +57,6 @@ def main():
     env["GEMINI_MODEL"] = os.environ.get("GEMINI_MODEL", "")
     env["GEMINI_API_KEY"] = os.environ.get("GEMINI_API_KEY", "")
 
-    print(f"🔧 Environment: {env}")
-
     prompt = USER_PROMPT_TEMPLATE.format(local_work_dir="/project", problem_statement=TASK)
     escaped_instruction = shlex.quote(prompt)
 

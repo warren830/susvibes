@@ -16,6 +16,7 @@ See also: ``evaluation_harness/PROMPTS.md`` for the prompt architecture, and
 
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
 import time
@@ -232,6 +233,23 @@ def normalize_prediction(
 
 # ── Concrete Docker container lifecycle ───────────────────────────────
 
+#: Agent env vars as a shell file inside the container; every in-container
+#: command sources it after the subclass's ``env_source_files``.
+AGENT_ENV_FILE = "/root/.bench_agent_env"
+
+
+def agent_env_script(env: Mapping[str, str]) -> str:
+    """Shell lines exporting each non-empty value of ``env``.
+
+    Values are quoted so the shell never re-parses them.  Empty values are
+    left out so they cannot override what the setup script's env files set.
+    """
+    return "".join(
+        f"export {key}={shlex.quote(str(value))}\n"
+        for key, value in env.items()
+        if value
+    )
+
 
 class DockerHarnessBase:
     """Shared Docker container lifecycle for Docker CLI agent harnesses.
@@ -353,15 +371,42 @@ class DockerHarnessBase:
         self.workspace_container = container_name
         print(f"✅ Container {container_name} started with live volume sync")
 
+    def sourced_env_files(self) -> list[str]:
+        """Files sourced before each in-container command, in order.
+
+        The agent env file comes last, so its values win.
+        """
+        return [*self.env_source_files, AGENT_ENV_FILE]
+
     def _env_source_block(self) -> str:
         """Build the shell block that sources the agent env files."""
         lines = ["\n"]
-        for path in self.env_source_files:
+        for path in self.sourced_env_files():
             lines.append(f"        [ -f {path} ] && source {path}\n")
         return "".join(lines)
 
-    def execute_in_container(self, command: str, env: dict = {}) -> dict:
+    def write_agent_env(self, env: Mapping[str, str]) -> None:
+        """Replace the container's agent env file with ``env``.
+
+        The content goes over ``docker exec`` stdin, so no value is ever part
+        of a command line; the file is created with mode 0600.
+        """
+        subprocess.run(
+            [
+                "docker", "exec", "-i", self.workspace_container,
+                "bash", "-c", f"umask 077 && cat > {AGENT_ENV_FILE}",
+            ],
+            input=agent_env_script(env),
+            capture_output=True, text=True, check=True,
+        )
+
+    def execute_in_container(
+        self, command: str, env: Mapping[str, str] | None = None
+    ) -> dict:
         """Execute a command in the persistent container.
+
+        ``env``, when given, first replaces the agent env file (see
+        ``write_agent_env``), so it also applies to later commands.
 
         Returns a dict with stdout, stderr, return_code, execution_time,
         command, and success.
@@ -371,15 +416,7 @@ class DockerHarnessBase:
 
         start_time = time.time()
 
-        full_command = self._env_source_block()
-        print(f"🔧 Environment: {env}")
-        if env:
-            for key, value in env.items():
-                full_command += f"export {key}={value}\n"
-
-        print(f"🔧 Full command: {full_command}")
-
-        full_command += f"{command}"
+        full_command = self._env_source_block() + command
 
         exec_cmd = [
             "docker", "exec",
@@ -389,6 +426,8 @@ class DockerHarnessBase:
         ]
 
         try:
+            if env:
+                self.write_agent_env(env)
             result = subprocess.run(
                 exec_cmd, capture_output=True, text=True, timeout=3000
             )

@@ -30,6 +30,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Batch options every child run gets unchanged; run_batch_process sets the
+# others (jsonl_file, workspace_root, num_instances, timestamp_suffix) per process.
+FORWARDED_BATCH_OPTIONS = [
+    'results_dir', 'model', 'setup_script', 'setup_assets', 'claude_code_version',
+    'allowed_tools', 'disallowed_tools', 'timeout', 'agent_driver', 'strategy',
+]
+
 
 def get_options():
     # Get the base parser from batch_run_docker.py
@@ -96,17 +103,28 @@ def load_instances(jsonl_file: str) -> List[Dict[str, Any]]:
         return []
 
 
+def forwarded_batch_args(args) -> List[str]:
+    """
+    Command-line arguments that give a child run the parent's batch options.
+    """
+    batch_args = []
+    for name in FORWARDED_BATCH_OPTIONS:
+        value = getattr(args, name)
+        if value is not None:
+            batch_args += [f'--{name}', str(value)]
+    if args.keep_workspace:
+        batch_args.append('--keep_workspace')
+    return batch_args
+
+
 def run_batch_process(
     process_id: int,
     start_idx: int,
     num_instances: int,
     jsonl_file: str,
-    results_dir: str,
     workspace_root: str,
-    model: str,
-    setup_script: str,
     python_executable: str,
-    keep_workspace: bool = True,
+    batch_args: List[str],
     temp_jsonl: str = None
 ) -> Dict[str, Any]:
     """
@@ -117,12 +135,9 @@ def run_batch_process(
         start_idx: Start index in the dataset
         num_instances: Number of instances to process
         jsonl_file: Path to the JSONL file
-        results_dir: Path to the results directory
         workspace_root: Path to the workspace root
-        model: Model name
-        setup_script: Setup script path
         python_executable: Python executable to use
-        keep_workspace: Whether to keep the workspace after cleanup
+        batch_args: Arguments from forwarded_batch_args
         temp_jsonl: Optional temporary JSONL file path
         
     Returns:
@@ -150,15 +165,11 @@ def run_batch_process(
         python_executable,
         'batch_run_docker.py',
         '--jsonl_file', target_jsonl,
-        '--results_dir', results_dir,
         '--workspace_root', process_workspace_str,
         '--num_instances', str(num_instances),
-        '--model', model,
-        '--setup_script', setup_script,
         '--timestamp_suffix', f'process{process_id}',
+        *batch_args,
     ]
-    if keep_workspace:
-        cmd.append('--keep_workspace')
     
     start_time = time.time()
     
@@ -349,12 +360,9 @@ def main():
                     task['start_idx'],
                     task['num_instances'],
                     args.jsonl_file,
-                    args.results_dir,
                     args.workspace_root,
-                    args.model,
-                    args.setup_script,
                     args.python_executable,
-                    args.keep_workspace,
+                    forwarded_batch_args(args),
                     task.get('temp_jsonl')  # Pass temp_jsonl if it exists
                 )
             )

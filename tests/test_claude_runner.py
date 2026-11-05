@@ -115,6 +115,12 @@ def batch(tmp_path, monkeypatch):
     return import_agent_module("claude_code", "batch_run_docker")
 
 
+@pytest.fixture()
+def parallel(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    return import_agent_module("claude_code", "parallel_batch_run")
+
+
 def run_instance(batch, tmp_path, docker, **options):
     setup_script = tmp_path / "setup.sh"
     setup_script.write_text("echo setup\n")
@@ -404,3 +410,46 @@ def test_hung_driver_is_stopped_after_the_grace_period(batch, tmp_path, driver, 
 
     assert record["timed_out"] is True
     assert record["claude_success"] is False
+
+
+
+# ── parallel runs ─────────────────────────────────────────────────────
+
+
+def test_child_runs_get_every_batch_option(parallel, tmp_path):
+    options = {
+        "--results_dir": "out",
+        "--model": "arm2",
+        "--setup_script": "../bench/arm2-setup.sh",
+        "--setup_assets": "../bench/assets",
+        "--claude_code_version": "2.1.318",
+        "--allowed_tools": "Bash,Skill,mcp__security-agent__*",
+        "--disallowed_tools": "",
+        "--timeout": "10800",
+        "--agent_driver": "../bench/driver",
+        "--strategy": "generic",
+    }
+    argv = [arg for option in options.items() for arg in option] + ["--keep_workspace"]
+    args = parallel.get_options().parse_args(argv)
+
+    with mock.patch.object(subprocess, "run") as run:
+        run.return_value = mock.MagicMock(returncode=0)
+        parallel.run_batch_process(
+            0, 0, 1, "data.jsonl", str(tmp_path / "workspace"), "python3",
+            parallel.forwarded_batch_args(args),
+        )
+
+    cmd = run.call_args.args[0]
+    assert cmd[:2] == ["python3", "batch_run_docker.py"]
+    child = parallel.get_batch_options().parse_args(cmd[2:])
+    for option in options:
+        name = option.removeprefix("--")
+        assert getattr(child, name) == getattr(args, name), name
+    assert child.keep_workspace is True
+
+
+def test_every_batch_option_is_forwarded_or_set_per_process(parallel):
+    per_process = {"jsonl_file", "workspace_root", "start_idx", "num_instances", "load_from_file", "timestamp_suffix"}
+    batch_options = {action.dest for action in parallel.get_batch_options()._actions} - {"help"}
+
+    assert batch_options - per_process == {*parallel.FORWARDED_BATCH_OPTIONS, "keep_workspace"}

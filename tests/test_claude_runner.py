@@ -43,13 +43,15 @@ INSTANCE = {
 
 
 PATCH = "diff --git a/parse.py b/parse.py\n"
+BASE_COMMIT = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
 class FakeDocker:
     """Stands in for the docker CLI and records each call.
 
     Every call succeeds unless its in-container script contains one of
-    ``failing``.  Copying a file out of the container yields ``PATCH``.
+    ``failing``.  ``git rev-parse`` answers ``BASE_COMMIT``, and copying a
+    file out of the container yields ``PATCH``.
     """
 
     def __init__(self, failing=()):
@@ -63,7 +65,9 @@ class FakeDocker:
         script = argv[-1] if argv[:2] == ["docker", "exec"] else ""
         failed = any(marker in script for marker in self.failing)
         return mock.MagicMock(
-            stdout="", stderr="boom" if failed else "", returncode=1 if failed else 0
+            stdout=f"{BASE_COMMIT}\n" if "rev-parse" in argv else "",
+            stderr="boom" if failed else "",
+            returncode=1 if failed else 0,
         )
 
     @staticmethod
@@ -222,8 +226,11 @@ def test_patch_is_taken_in_the_container_after_claude_runs(batch, tmp_path):
     record = run_instance(batch, tmp_path, docker)
 
     assert record["model_patch"] == PATCH
+    base_read = docker.index(lambda argv: "rev-parse" in argv)
     claude_run = docker.index(lambda argv: "claude --verbose" in argv[-1])
     git_add = docker.index(lambda argv: argv[:2] == ["docker", "exec"] and "add" in argv and "git" in argv)
+    git_diff = docker.index(lambda argv: argv[:2] == ["docker", "exec"] and "diff" in argv and "git" in argv)
     copy_out = docker.index(FakeDocker.copies_file_out)
-    assert claude_run < git_add < copy_out
+    assert base_read < claude_run < git_add < git_diff < copy_out
     assert docker.calls[git_add][2:4] == ["-w", "/project"]
+    assert BASE_COMMIT in docker.calls[git_diff]

@@ -182,6 +182,8 @@ async def process_instance(
                     "workspace": str(workspace)
                 }
 
+            base_commit = integration.head_commit()
+
             # Run Claude with the problem statement
             logger.info(f"Running Claude for {instance_id}")
             tool_flags = claude_tool_flags(allowed_tools, disallowed_tools)
@@ -203,7 +205,7 @@ async def process_instance(
             print(f"📁 Your improved code is at: {workspace}")
             
             # Get git diff
-            diff_text = integration.extract_patch()
+            diff_text = integration.extract_patch(base_commit)
             
             result_dict = {
                 "instance_id": instance_id,

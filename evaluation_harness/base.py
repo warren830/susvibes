@@ -273,17 +273,18 @@ CONTAINER_PATCH_FILE = "/tmp/model_patch.diff"
 _GIT = ["git", "-c", "safe.directory=*"]
 
 
-def patch_git_commands(output_path: str) -> list[list[str]]:
-    """git commands that write the model patch to ``output_path``.
+def patch_git_commands(output_path: str, base_commit: str) -> list[list[str]]:
+    """git commands that write the changes since ``base_commit`` to ``output_path``.
 
     Run them in order in the work dir, inside the container or not.
-    ``git add -A -N`` records new files as intent-to-add, so ``git diff
-    HEAD`` shows them along with tracked edits, staged or not.
+    ``git add -A -N`` records new files as intent-to-add, so the diff shows
+    them along with tracked edits, staged or not.  Diffing against the
+    commit the agent started from, not HEAD, keeps work it committed.
     """
     pathspecs = ["--", ".", *PATCH_EXCLUDES]
     return [
         [*_GIT, "add", "-A", "-N", *pathspecs],
-        [*_GIT, "diff", f"--output={output_path}", "HEAD", *pathspecs],
+        [*_GIT, "diff", f"--output={output_path}", base_commit, *pathspecs],
     ]
 
 
@@ -627,12 +628,27 @@ class DockerHarnessBase:
                 "execution_time": 0,
             }
 
-    def extract_patch(self) -> str:
-        """The agent's diff, new files included, taken inside the container.
+    def head_commit(self) -> str:
+        """The commit the workspace is at, read inside the container."""
+        result = subprocess.run(
+            [
+                "docker", "exec",
+                "-w", self.container_work_dir,
+                self.workspace_container,
+                *_GIT, "rev-parse", "HEAD",
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        return result.stdout.strip()
 
-        Paths in ``PATCH_EXCLUDES`` are left out.
+    def extract_patch(self, base_commit: str = "HEAD") -> str:
+        """The diff since ``base_commit``, new files included, taken inside
+        the container.
+
+        Pass the ``head_commit()`` read before the agent ran to keep what
+        it committed.  Paths in ``PATCH_EXCLUDES`` are left out.
         """
-        for git_command in patch_git_commands(CONTAINER_PATCH_FILE):
+        for git_command in patch_git_commands(CONTAINER_PATCH_FILE, base_commit):
             subprocess.run(
                 [
                     "docker", "exec",

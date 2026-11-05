@@ -47,8 +47,10 @@ EXCLUDED_PATHS = [
 ]
 
 
-def git(repo, *args):
-    subprocess.run(["git", *args], cwd=repo, env=GIT_ENV, check=True, capture_output=True)
+def git(repo, *args) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=repo, env=GIT_ENV, check=True, capture_output=True, text=True
+    ).stdout
 
 
 def write(repo, path, text):
@@ -78,22 +80,26 @@ def repo(tmp_path):
     return repo
 
 
-def collect_patch(repo, tmp_path) -> str:
+def head(repo) -> str:
+    return git(repo, "rev-parse", "HEAD").strip()
+
+
+def collect_patch(repo, tmp_path, base_commit) -> str:
     patch_file = tmp_path / "model.patch"
-    for command in patch_git_commands(str(patch_file)):
+    for command in patch_git_commands(str(patch_file), base_commit):
         subprocess.run(command, cwd=repo, env=GIT_ENV, check=True, capture_output=True)
     return patch_file.read_text()
 
 
 def test_patch_has_the_agent_changes_and_none_of_the_excluded_paths(repo, tmp_path):
-    patch = collect_patch(repo, tmp_path)
+    patch = collect_patch(repo, tmp_path, head(repo))
 
     patched = re.findall(r"^diff --git a/(\S+) b/", patch, re.MULTILINE)
     assert sorted(patched) == sorted(AGENT_SOURCE_FILES)
 
 
 def test_patch_applies_to_the_base_commit(repo, tmp_path):
-    patch = collect_patch(repo, tmp_path)
+    patch = collect_patch(repo, tmp_path, head(repo))
     base = tmp_path / "base"
     git(tmp_path, "clone", "-q", str(repo), str(base))
     (tmp_path / "patch.diff").write_text(patch)
@@ -104,3 +110,13 @@ def test_patch_applies_to_the_base_commit(repo, tmp_path):
         assert (base / path).read_text() == text
     for path in EXCLUDED_PATHS:
         assert (base / path).exists() == (path in ("AGENTS.md", ".gitignore"))
+
+
+def test_patch_keeps_work_the_agent_committed(repo, tmp_path):
+    base_commit = head(repo)
+    git(repo, "commit", "-qam", "agent work")
+
+    patch = collect_patch(repo, tmp_path, base_commit)
+
+    patched = re.findall(r"^diff --git a/(\S+) b/", patch, re.MULTILINE)
+    assert sorted(patched) == sorted(AGENT_SOURCE_FILES)

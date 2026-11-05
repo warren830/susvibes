@@ -48,6 +48,7 @@ def get_options():
     parser.add_argument('--claude_code_version', type=str, default=None, help="Claude Code version the setup script installs, passed to it as CLAUDE_CODE_VERSION (default: the script's own)")
     parser.add_argument('--allowed_tools', type=str, default=','.join(ALLOWED_TOOLS), help='Comma-separated tools Claude may use without asking')
     parser.add_argument('--disallowed_tools', type=str, default=','.join(DISALLOWED_TOOLS), help='Comma-separated tools Claude may not use')
+    parser.add_argument('--timeout', type=int, default=3000, help='Seconds the agent may run on one instance')
     parser.add_argument('--timestamp_suffix', type=str, default=None, help='Suffix to append to timestamp for unique directory names (for parallel runs)')
     parser.add_argument('--keep_workspace', action='store_true', default=False, help='Whether to keep the workspace after cleanup')
     parser.add_argument('--strategy', type=str, default='none', choices=['none', 'generic'],
@@ -105,6 +106,7 @@ async def process_instance(
     claude_code_version: Optional[str] = None,
     allowed_tools: List[str] = ALLOWED_TOOLS,
     disallowed_tools: List[str] = DISALLOWED_TOOLS,
+    timeout: int = 3000,
 ) -> Dict[str, Any]:
     """
     Process a single instance with Docker-based Claude execution.
@@ -120,6 +122,7 @@ async def process_instance(
         claude_code_version: Claude Code version the setup script installs
         allowed_tools: Tools Claude may use without asking
         disallowed_tools: Tools Claude may not use
+        timeout: Seconds the agent may run
 
     Returns:
         Result dictionary with instance_id, model, and model_patch
@@ -192,7 +195,7 @@ async def process_instance(
                 f"-p {escaped_instruction} {tool_flags}"
             )
             
-            result = integration.execute_in_container(claude_command, env=env)
+            result = integration.execute_in_container(claude_command, env=env, timeout=timeout)
             
             if result["success"]:
                 logger.info(f"Claude execution completed successfully for {instance_id}")
@@ -214,7 +217,8 @@ async def process_instance(
                 "workspace": str(workspace),
                 "claude_stdout": result.get("stdout", ""),
                 "claude_stderr": result.get("stderr", ""),
-                "claude_success": result.get("success", False)
+                "claude_success": result.get("success", False),
+                "timed_out": result.get("timed_out", False)
             }
             
             # Clean up the integration
@@ -287,6 +291,7 @@ async def main(args):
                 claude_code_version=args.claude_code_version,
                 allowed_tools=split_tools(args.allowed_tools),
                 disallowed_tools=split_tools(args.disallowed_tools),
+                timeout=args.timeout,
             )
             
             # Save intermediate results every instance

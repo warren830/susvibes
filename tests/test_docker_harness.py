@@ -167,12 +167,14 @@ def test_execute_timeout_returns_failure():
     harness.workspace_container = "foo_work_123"
 
     with mock.patch("evaluation_harness.base.subprocess.run") as run:
-        run.side_effect = real_subprocess.TimeoutExpired(cmd="x", timeout=3000)
-        result = harness.execute_in_container("run-agent")
+        run.side_effect = real_subprocess.TimeoutExpired(cmd="x", timeout=10800)
+        result = harness.execute_in_container("run-agent", timeout=10800)
 
+    assert run.call_args.kwargs["timeout"] == 10800
     assert result["success"] is False
+    assert result["timed_out"] is True
     assert result["return_code"] == -1
-    assert "timed out" in result["stderr"]
+    assert "timed out after 10800 seconds" in result["stderr"]
 
 
 # ── setup_cli_env ─────────────────────────────────────────────────────

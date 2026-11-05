@@ -38,6 +38,7 @@ class AgentResult(TypedDict, total=False):
     return_code: int
     execution_time: float
     success: bool
+    timed_out: bool
 
 
 class PredictionRecord(TypedDict, total=False):
@@ -182,7 +183,10 @@ class DockerHarness(AgentHarness, Protocol):
     workspace_container: str | None
 
     def execute_in_container(
-        self, command: str, env: Mapping[str, str] | None = None
+        self,
+        command: str,
+        env: Mapping[str, str] | None = None,
+        timeout: float = 3000,
     ) -> AgentResult:
         """Run a shell command inside the agent's Docker container."""
         ...
@@ -451,7 +455,10 @@ class DockerHarnessBase:
         )
 
     def execute_in_container(
-        self, command: str, env: Mapping[str, str] | None = None
+        self,
+        command: str,
+        env: Mapping[str, str] | None = None,
+        timeout: float = 3000,
     ) -> dict:
         """Execute a command in the persistent container.
 
@@ -459,7 +466,8 @@ class DockerHarnessBase:
         ``write_agent_env``), so it also applies to later commands.
 
         Returns a dict with stdout, stderr, return_code, execution_time,
-        command, and success.
+        command, and success; ``timed_out`` is set when the command ran
+        past ``timeout`` seconds.
         """
         if not self.workspace_container:
             raise RuntimeError("No persistent container available")
@@ -479,7 +487,7 @@ class DockerHarnessBase:
             if env:
                 self.write_agent_env(env)
             result = subprocess.run(
-                exec_cmd, capture_output=True, text=True, timeout=3000
+                exec_cmd, capture_output=True, text=True, timeout=timeout
             )
             execution_time = time.time() - start_time
 
@@ -495,11 +503,12 @@ class DockerHarnessBase:
         except subprocess.TimeoutExpired:
             return {
                 "stdout": "",
-                "stderr": "Command timed out after 5 minutes",
+                "stderr": f"Command timed out after {timeout} seconds",
                 "return_code": -1,
-                "execution_time": 300,
+                "execution_time": time.time() - start_time,
                 "command": command,
                 "success": False,
+                "timed_out": True,
             }
         except Exception as e:
             return {

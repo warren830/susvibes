@@ -50,16 +50,22 @@ class FakeDocker:
     """Stands in for the docker CLI and records each call.
 
     Every call succeeds unless its in-container script contains one of
-    ``failing``.  ``git rev-parse`` answers ``BASE_COMMIT``, and copying a
-    file out of the container yields ``PATCH``.
+    ``failing``, or one of ``hanging``, which runs into its timeout.
+    ``git rev-parse`` answers ``BASE_COMMIT``, and copying a file out of
+    the container yields ``PATCH``.
     """
 
-    def __init__(self, failing=()):
+    def __init__(self, failing=(), hanging=()):
         self.failing = failing
+        self.hanging = hanging
         self.calls = []
+        self.options = []
 
     def __call__(self, argv, **kwargs):
         self.calls.append(argv)
+        self.options.append(kwargs)
+        if any(marker in argv[-1] for marker in self.hanging):
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
         if self.copies_file_out(argv):
             Path(argv[3]).write_text(PATCH)
         script = argv[-1] if argv[:2] == ["docker", "exec"] else ""
@@ -234,3 +240,27 @@ def test_patch_is_taken_in_the_container_after_claude_runs(batch, tmp_path):
     assert base_read < claude_run < git_add < git_diff < copy_out
     assert docker.calls[git_add][2:4] == ["-w", "/project"]
     assert BASE_COMMIT in docker.calls[git_diff]
+
+
+
+# ── timeout ───────────────────────────────────────────────────────────
+
+
+def test_timeout_bounds_the_claude_run(batch, tmp_path):
+    docker = FakeDocker()
+
+    record = run_instance(batch, tmp_path, docker, timeout=10800)
+
+    claude_run = docker.index(lambda argv: "claude --verbose" in argv[-1])
+    assert docker.options[claude_run]["timeout"] == 10800
+    assert record["timed_out"] is False
+
+
+def test_timed_out_claude_run_is_recorded(batch, tmp_path):
+    docker = FakeDocker(hanging=("claude --verbose",))
+
+    record = run_instance(batch, tmp_path, docker, timeout=60)
+
+    assert record["timed_out"] is True
+    assert record["claude_success"] is False
+    assert record["model_patch"] == PATCH

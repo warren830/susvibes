@@ -7,7 +7,6 @@ with Docker-based Claude execution, and saves the git diff results to JSON files
 """
 
 import json
-import os
 import subprocess
 import asyncio
 import time
@@ -59,25 +58,6 @@ def get_options():
 def split_tools(value: str) -> List[str]:
     """Tool names from a comma-separated option value."""
     return [tool.strip() for tool in value.split(',') if tool.strip()]
-
-
-def simple_git_diff(dirpath: str) -> str:
-    """
-    Get git diff from the specified directory.
-    
-    Args:
-        dirpath: Path to the directory to get git diff from
-        
-    Returns:
-        Git diff output as string
-    """
-    original_cwd = os.getcwd()
-    try:
-        os.chdir(dirpath)
-        result = subprocess.run(['git', 'diff'], capture_output=True, text=True)
-        return result.stdout
-    finally:
-        os.chdir(original_cwd)
 
 
 def load_instances(jsonl_file: str) -> List[Dict[str, Any]]:
@@ -223,7 +203,7 @@ async def process_instance(
             print(f"📁 Your improved code is at: {workspace}")
             
             # Get git diff
-            diff_text = simple_git_diff(str(workspace))
+            diff_text = integration.extract_patch()
             
             result_dict = {
                 "instance_id": instance_id,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -41,11 +42,14 @@ INSTANCE = {
 }
 
 
+PATCH = "diff --git a/parse.py b/parse.py\n"
+
+
 class FakeDocker:
     """Stands in for the docker CLI and records each call.
 
     Every call succeeds unless its in-container script contains one of
-    ``failing``.
+    ``failing``.  Copying a file out of the container yields ``PATCH``.
     """
 
     def __init__(self, failing=()):
@@ -54,15 +58,25 @@ class FakeDocker:
 
     def __call__(self, argv, **kwargs):
         self.calls.append(argv)
+        if self.copies_file_out(argv):
+            Path(argv[3]).write_text(PATCH)
         script = argv[-1] if argv[:2] == ["docker", "exec"] else ""
         failed = any(marker in script for marker in self.failing)
         return mock.MagicMock(
             stdout="", stderr="boom" if failed else "", returncode=1 if failed else 0
         )
 
+    @staticmethod
+    def copies_file_out(argv):
+        return argv[:2] == ["docker", "cp"] and ":" in argv[2] and not argv[2].endswith("/.")
+
     def scripts(self):
         """The ``bash -c`` scripts run in the container, in order."""
         return [argv[-1] for argv in self.calls if argv[:2] == ["docker", "exec"] and argv[-2] == "-c"]
+
+    def index(self, predicate):
+        """Position of the first call whose argv satisfies ``predicate``."""
+        return next(i for i, argv in enumerate(self.calls) if predicate(argv))
 
 
 @pytest.fixture()
@@ -197,3 +211,19 @@ def test_tool_options_parse_as_comma_lists(batch):
 
     assert batch.split_tools(args.allowed_tools) == ["Bash", "Skill", "mcp__x__*"]
     assert batch.split_tools(args.disallowed_tools) == []
+
+
+# ── patch ─────────────────────────────────────────────────────────────
+
+
+def test_patch_is_taken_in_the_container_after_claude_runs(batch, tmp_path):
+    docker = FakeDocker()
+
+    record = run_instance(batch, tmp_path, docker)
+
+    assert record["model_patch"] == PATCH
+    claude_run = docker.index(lambda argv: "claude --verbose" in argv[-1])
+    git_add = docker.index(lambda argv: argv[:2] == ["docker", "exec"] and "add" in argv and "git" in argv)
+    copy_out = docker.index(FakeDocker.copies_file_out)
+    assert claude_run < git_add < copy_out
+    assert docker.calls[git_add][2:4] == ["-w", "/project"]

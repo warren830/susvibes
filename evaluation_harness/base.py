@@ -19,6 +19,7 @@ from __future__ import annotations
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Mapping, Protocol, TypedDict, runtime_checkable
@@ -246,6 +247,44 @@ AGENT_ENV_FILE = "/root/.bench_agent_env"
 #: both stay outside the workspace the agent sees.
 SETUP_SCRIPT_PATH = "/opt/setup-env.sh"
 BENCH_ASSETS_DIR = "/opt/bench-assets"
+
+
+#: Root-level paths left out of the model patch: workflow records and agent
+#: config that setup scripts and agents write, not part of a solution.  A
+#: glob pathspec does not match the files under a directory it matches, so
+#: each glob also comes with ``/**``.
+PATCH_EXCLUDES = [
+    ":(exclude,glob)aidlc*",
+    ":(exclude,glob)aidlc*/**",
+    ":(exclude,glob).aidlc*",
+    ":(exclude,glob).aidlc*/**",
+    ":(exclude).claude",
+    ":(exclude)CLAUDE.md",
+    ":(exclude)AGENTS.md",
+    ":(exclude).mcp.json",
+    ":(exclude).gitignore",
+    ":(exclude)setup-env.sh",
+]
+
+#: Where the patch is written inside the container before ``docker cp``.
+CONTAINER_PATCH_FILE = "/tmp/model_patch.diff"
+
+# The workspace is owned by the host user, not by root in the container.
+_GIT = ["git", "-c", "safe.directory=*"]
+
+
+def patch_git_commands(output_path: str) -> list[list[str]]:
+    """git commands that write the model patch to ``output_path``.
+
+    Run them in order in the work dir, inside the container or not.
+    ``git add -A -N`` records new files as intent-to-add, so ``git diff
+    HEAD`` shows them along with tracked edits, staged or not.
+    """
+    pathspecs = ["--", ".", *PATCH_EXCLUDES]
+    return [
+        [*_GIT, "add", "-A", "-N", *pathspecs],
+        [*_GIT, "diff", f"--output={output_path}", "HEAD", *pathspecs],
+    ]
 
 
 def agent_env_script(env: Mapping[str, str]) -> str:
@@ -587,6 +626,33 @@ class DockerHarnessBase:
                 "command": f"setup from {setup_script_path}",
                 "execution_time": 0,
             }
+
+    def extract_patch(self) -> str:
+        """The agent's diff, new files included, taken inside the container.
+
+        Paths in ``PATCH_EXCLUDES`` are left out.
+        """
+        for git_command in patch_git_commands(CONTAINER_PATCH_FILE):
+            subprocess.run(
+                [
+                    "docker", "exec",
+                    "-w", self.container_work_dir,
+                    self.workspace_container,
+                    *git_command,
+                ],
+                capture_output=True, text=True, check=True,
+            )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_patch = Path(tmp_dir) / "model_patch.diff"
+            subprocess.run(
+                [
+                    "docker", "cp",
+                    f"{self.workspace_container}:{CONTAINER_PATCH_FILE}",
+                    str(local_patch),
+                ],
+                capture_output=True, text=True, check=True,
+            )
+            return local_patch.read_text(encoding="utf-8")
 
     def cleanup(self):
         """Stop and remove the container; optionally preserve the workspace."""

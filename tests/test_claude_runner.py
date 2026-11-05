@@ -7,13 +7,17 @@ Docker is never called: the docker CLI is replaced by a fake at
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
+import sys
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from tests.agent_import import import_agent_module
+
+REAL_RUN = subprocess.run
 
 # The forwarded names, as the runner/driver contract lists them.
 CONTRACT_ENV_NAMES = [
@@ -52,7 +56,7 @@ class FakeDocker:
     Every call succeeds unless its in-container script contains one of
     ``failing``, or one of ``hanging``, which runs into its timeout.
     ``git rev-parse`` answers ``BASE_COMMIT``, and copying a file out of
-    the container yields ``PATCH``.
+    the container yields ``PATCH``.  Commands other than docker really run.
     """
 
     def __init__(self, failing=(), hanging=()):
@@ -64,6 +68,8 @@ class FakeDocker:
     def __call__(self, argv, **kwargs):
         self.calls.append(argv)
         self.options.append(kwargs)
+        if argv[0] != "docker":
+            return REAL_RUN(argv, **kwargs)
         if any(marker in argv[-1] for marker in self.hanging):
             raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
         if self.copies_file_out(argv):
@@ -87,6 +93,14 @@ class FakeDocker:
     def index(self, predicate):
         """Position of the first call whose argv satisfies ``predicate``."""
         return next(i for i, argv in enumerate(self.calls) if predicate(argv))
+
+    def container_name(self):
+        run = self.calls[self.index(lambda argv: argv[:2] == ["docker", "run"])]
+        return run[run.index("--name") + 1]
+
+    def env_file_writes(self):
+        """(call index, content) of each write to the agent env file."""
+        return [(i, self.options[i]["input"]) for i, argv in enumerate(self.calls) if "-i" in argv]
 
 
 @pytest.fixture()
@@ -264,3 +278,123 @@ def test_timed_out_claude_run_is_recorded(batch, tmp_path):
     assert record["timed_out"] is True
     assert record["claude_success"] is False
     assert record["model_patch"] == PATCH
+
+
+
+# ── agent env delivery ────────────────────────────────────────────────
+
+
+def test_agent_env_reaches_the_container_only_over_stdin(batch, tmp_path, monkeypatch):
+    secret = "AKIA-secret value"
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    docker = FakeDocker()
+
+    run_instance(batch, tmp_path, docker)
+
+    assert not any(secret in arg for argv in docker.calls for arg in argv)
+    (write_at, content), = docker.env_file_writes()
+    assert f"export AWS_SECRET_ACCESS_KEY='{secret}'" in content.splitlines()
+    assert "export AWS_REGION=us-west-2" in content.splitlines()
+    assert write_at < docker.index(lambda argv: "claude --verbose" in argv[-1])
+
+
+# ── agent driver ──────────────────────────────────────────────────────
+
+FAKE_DRIVER = """\
+import argparse, json, os, pathlib, sys, time
+parser = argparse.ArgumentParser()
+for flag in ("--container", "--workdir", "--prompt-file", "--out-dir", "--timeout",
+             "--allowed-tools", "--disallowed-tools"):
+    parser.add_argument(flag, required=True)
+parser.add_argument("--source", action="append", required=True)
+args = parser.parse_args()
+behavior = os.environ.get("FAKE_DRIVER", "completed")
+if behavior == "crash":
+    sys.exit("driver crashed")
+if behavior == "hang":
+    time.sleep(30)
+out = pathlib.Path(args.out_dir)
+seen = dict(vars(args), prompt=pathlib.Path(args.prompt_file).read_text(encoding="utf-8"))
+(out / "seen.json").write_text(json.dumps(seen))
+(out / "raw.jsonl").write_text('{"type": "result", "num_turns": 3}\\n')
+(out / "summary.json").write_text(json.dumps({"status": behavior, "num_turns": 3}))
+"""
+
+
+@pytest.fixture()
+def driver(tmp_path):
+    path = tmp_path / "fake-driver"
+    path.write_text(f"#!{sys.executable}\n" + FAKE_DRIVER)
+    path.chmod(0o755)
+    return str(path)
+
+
+def run_with_driver(batch, tmp_path, docker, driver, **options):
+    return run_instance(
+        batch, tmp_path, docker,
+        agent_driver=driver, artifacts_root=str(tmp_path / "artifacts"), **options,
+    )
+
+
+def test_driver_runs_the_agent_step_per_the_contract(batch, tmp_path, driver):
+    docker = FakeDocker()
+
+    record = run_with_driver(batch, tmp_path, docker, driver, timeout=10800)
+
+    artifacts_dir = tmp_path / "artifacts" / INSTANCE["instance_id"]
+    seen = json.loads((artifacts_dir / "seen.json").read_text())
+    assert seen["container"] == docker.container_name()
+    assert seen["workdir"] == "/project"
+    assert INSTANCE["problem_statement"] in seen["prompt"]
+    assert Path(seen["prompt_file"]).parent == artifacts_dir
+    assert seen["out_dir"] == str(artifacts_dir)
+    assert seen["timeout"] == "10800"
+    assert seen["allowed_tools"] == ",".join([*UPSTREAM_TOOLS, "Skill", "Task", "mcp__security-agent__*"])
+    assert seen["disallowed_tools"] == "mcp__security-agent__setup"
+    assert seen["source"] == [
+        "/root/.claude_env", "/root/.nvm/nvm.sh", "/root/.bashrc", "/root/.bench_agent_env",
+    ]
+
+    assert not any("claude --verbose" in script for script in docker.scripts())
+    (write_at, _), = docker.env_file_writes()
+    assert write_at < docker.index(lambda argv: argv[0] == driver)
+
+    assert record["claude_stdout"] == (artifacts_dir / "raw.jsonl").read_text()
+    assert record["agent_summary"] == {"status": "completed", "num_turns": 3}
+    assert record["artifacts_dir"] == str(artifacts_dir)
+    assert record["claude_success"] is True
+    assert record["timed_out"] is False
+    assert record["model_patch"] == PATCH
+
+
+def test_driver_timeout_status_is_recorded(batch, tmp_path, driver, monkeypatch):
+    monkeypatch.setenv("FAKE_DRIVER", "timeout")
+
+    record = run_with_driver(batch, tmp_path, FakeDocker(), driver)
+
+    assert record["timed_out"] is True
+    assert record["claude_success"] is False
+    assert record["agent_summary"]["status"] == "timeout"
+
+
+def test_crashed_driver_leaves_a_failed_record_with_its_stderr(batch, tmp_path, driver, monkeypatch):
+    monkeypatch.setenv("FAKE_DRIVER", "crash")
+
+    record = run_with_driver(batch, tmp_path, FakeDocker(), driver)
+
+    assert record["claude_success"] is False
+    assert record["agent_summary"] is None
+    assert record["claude_stdout"] == ""
+    assert "driver crashed" in record["claude_stderr"]
+    assert record["model_patch"] == PATCH
+
+
+def test_hung_driver_is_stopped_after_the_grace_period(batch, tmp_path, driver, monkeypatch):
+    monkeypatch.setenv("FAKE_DRIVER", "hang")
+    monkeypatch.setattr(batch, "DRIVER_GRACE_SECONDS", 0)
+
+    record = run_with_driver(batch, tmp_path, FakeDocker(), driver, timeout=1)
+
+    assert record["timed_out"] is True
+    assert record["claude_success"] is False

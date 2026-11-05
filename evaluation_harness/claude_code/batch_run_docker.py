@@ -34,6 +34,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+#: Seconds an agent driver gets past --timeout to stop the agent and write its files.
+DRIVER_GRACE_SECONDS = 300
+
 def get_options():
     parser = argparse.ArgumentParser(description='Process multiple tasks with Docker-based Claude execution')
     parser.add_argument('--jsonl_file', type=str, default='../datasets/susvibes_dataset.jsonl', help='Path to the JSONL file')
@@ -49,6 +52,7 @@ def get_options():
     parser.add_argument('--allowed_tools', type=str, default=','.join(ALLOWED_TOOLS), help='Comma-separated tools Claude may use without asking')
     parser.add_argument('--disallowed_tools', type=str, default=','.join(DISALLOWED_TOOLS), help='Comma-separated tools Claude may not use')
     parser.add_argument('--timeout', type=int, default=3000, help='Seconds the agent may run on one instance')
+    parser.add_argument('--agent_driver', type=str, default=None, help='Host executable that runs the agent step instead of claude -p (see README.md)')
     parser.add_argument('--timestamp_suffix', type=str, default=None, help='Suffix to append to timestamp for unique directory names (for parallel runs)')
     parser.add_argument('--keep_workspace', action='store_true', default=False, help='Whether to keep the workspace after cleanup')
     parser.add_argument('--strategy', type=str, default='none', choices=['none', 'generic'],
@@ -59,6 +63,63 @@ def get_options():
 def split_tools(value: str) -> List[str]:
     """Tool names from a comma-separated option value."""
     return [tool.strip() for tool in value.split(',') if tool.strip()]
+
+
+def run_agent_driver(
+    integration: DockerIntegration,
+    agent_driver: str,
+    prompt: str,
+    artifacts_dir: Path,
+    timeout: int,
+    allowed_tools: List[str],
+    disallowed_tools: List[str],
+) -> Dict[str, Any]:
+    """
+    Run the agent step through a host-side driver instead of claude -p.
+
+    The driver reads the prompt from a file in artifacts_dir and writes
+    raw.jsonl (the CLI's stream-json output) and summary.json there.
+
+    Returns:
+        The keys execute_in_container returns, plus agent_summary
+    """
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    prompt_file = artifacts_dir / "prompt.txt"
+    prompt_file.write_text(prompt, encoding="utf-8")
+    cmd = [
+        agent_driver,
+        "--container", integration.workspace_container,
+        "--workdir", integration.container_work_dir,
+        "--prompt-file", str(prompt_file),
+        "--out-dir", str(artifacts_dir),
+        "--timeout", str(timeout),
+        "--allowed-tools", ",".join(allowed_tools),
+        "--disallowed-tools", ",".join(disallowed_tools),
+    ]
+    for env_file in integration.sourced_env_files():
+        cmd += ["--source", env_file]
+
+    start_time = time.time()
+    try:
+        driver = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, timeout=timeout + DRIVER_GRACE_SECONDS)
+        return_code, stderr, driver_timed_out = driver.returncode, driver.stderr, False
+    except subprocess.TimeoutExpired:
+        return_code, driver_timed_out = -1, True
+        stderr = f"Agent driver timed out after {timeout + DRIVER_GRACE_SECONDS} seconds"
+
+    raw_file = artifacts_dir / "raw.jsonl"
+    summary_file = artifacts_dir / "summary.json"
+    summary = json.loads(summary_file.read_text(encoding="utf-8")) if summary_file.exists() else None
+    status = summary.get("status") if summary else None
+    return {
+        "stdout": raw_file.read_text(encoding="utf-8") if raw_file.exists() else "",
+        "stderr": stderr,
+        "return_code": return_code,
+        "execution_time": time.time() - start_time,
+        "success": return_code == 0 and status == "completed",
+        "timed_out": driver_timed_out or status == "timeout",
+        "agent_summary": summary,
+    }
 
 
 def load_instances(jsonl_file: str) -> List[Dict[str, Any]]:
@@ -107,6 +168,8 @@ async def process_instance(
     allowed_tools: List[str] = ALLOWED_TOOLS,
     disallowed_tools: List[str] = DISALLOWED_TOOLS,
     timeout: int = 3000,
+    agent_driver: Optional[str] = None,
+    artifacts_root: str = "artifacts",
 ) -> Dict[str, Any]:
     """
     Process a single instance with Docker-based Claude execution.
@@ -123,6 +186,8 @@ async def process_instance(
         allowed_tools: Tools Claude may use without asking
         disallowed_tools: Tools Claude may not use
         timeout: Seconds the agent may run
+        agent_driver: Host executable that runs the agent step instead of claude -p
+        artifacts_root: Directory holding each instance's driver artifacts
 
     Returns:
         Result dictionary with instance_id, model, and model_patch
@@ -186,16 +251,20 @@ async def process_instance(
                 }
 
             base_commit = integration.head_commit()
+            integration.write_agent_env(env)
 
             # Run Claude with the problem statement
             logger.info(f"Running Claude for {instance_id}")
-            tool_flags = claude_tool_flags(allowed_tools, disallowed_tools)
-            claude_command = (
-                "claude --verbose --output-format stream-json "
-                f"-p {escaped_instruction} {tool_flags}"
-            )
-            
-            result = integration.execute_in_container(claude_command, env=env, timeout=timeout)
+            if agent_driver:
+                artifacts_dir = Path(artifacts_root, instance_id).resolve()
+                result = run_agent_driver(integration, agent_driver, prompt, artifacts_dir, timeout, allowed_tools, disallowed_tools)
+            else:
+                tool_flags = claude_tool_flags(allowed_tools, disallowed_tools)
+                claude_command = (
+                    "claude --verbose --output-format stream-json "
+                    f"-p {escaped_instruction} {tool_flags}"
+                )
+                result = integration.execute_in_container(claude_command, timeout=timeout)
             
             if result["success"]:
                 logger.info(f"Claude execution completed successfully for {instance_id}")
@@ -220,6 +289,9 @@ async def process_instance(
                 "claude_success": result.get("success", False),
                 "timed_out": result.get("timed_out", False)
             }
+            if agent_driver:
+                result_dict["agent_summary"] = result["agent_summary"]
+                result_dict["artifacts_dir"] = str(artifacts_dir)
             
             # Clean up the integration
             integration.cleanup()
@@ -292,6 +364,8 @@ async def main(args):
                 allowed_tools=split_tools(args.allowed_tools),
                 disallowed_tools=split_tools(args.disallowed_tools),
                 timeout=args.timeout,
+                agent_driver=args.agent_driver,
+                artifacts_root=str(results_dir / "artifacts"),
             )
             
             # Save intermediate results every instance

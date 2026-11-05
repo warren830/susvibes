@@ -18,7 +18,7 @@ import argparse
 import shlex
 
 # Import the Docker integration classes
-from run_docker import DockerIntegration, USER_PROMPT_TEMPLATE, ALLOWED_TOOLS
+from run_docker import DockerIntegration, USER_PROMPT_TEMPLATE, ALLOWED_TOOLS, get_agent_env
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -147,12 +147,7 @@ async def process_instance(instance: Dict[str, Any], index: int, total: int, mod
         # Set up Docker integration
         logger.info(f"Starting Docker integration for {instance_id}")
         
-        env = {}
-        env["ANTHROPIC_MODEL"] = os.environ.get("ANTHROPIC_MODEL", "")
-        env["ANTHROPIC_BASE_URL"] = os.environ.get("ANTHROPIC_BASE_URL", "")
-        env["ANTHROPIC_AUTH_TOKEN"] = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
-        env["ANTHROPIC_API_KEY"] = os.environ.get("ANTHROPIC_API_KEY", "")
-        env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS", 50000)
+        env = get_agent_env()
         
         if strategy != "none":
             problem_statement = apply_safety_hint(problem_statement)

@@ -16,8 +16,10 @@ See also: ``evaluation_harness/PROMPTS.md`` for the prompt architecture, and
 
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Mapping, Protocol, TypedDict, runtime_checkable
@@ -36,6 +38,7 @@ class AgentResult(TypedDict, total=False):
     return_code: int
     execution_time: float
     success: bool
+    timed_out: bool
 
 
 class PredictionRecord(TypedDict, total=False):
@@ -180,12 +183,20 @@ class DockerHarness(AgentHarness, Protocol):
     workspace_container: str | None
 
     def execute_in_container(
-        self, command: str, env: Mapping[str, str] | None = None
+        self,
+        command: str,
+        env: Mapping[str, str] | None = None,
+        timeout: float = 3000,
     ) -> AgentResult:
         """Run a shell command inside the agent's Docker container."""
         ...
 
-    def setup_cli_env(self, setup_script_path: str | Path | None = None) -> None:
+    def setup_cli_env(
+        self,
+        setup_script_path: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+        assets_dir: str | None = None,
+    ) -> None:
         """Install the agent CLI inside the container."""
         ...
 
@@ -231,6 +242,67 @@ def normalize_prediction(
 
 
 # ── Concrete Docker container lifecycle ───────────────────────────────
+
+#: Agent env vars as a shell file inside the container; every in-container
+#: command sources it after the subclass's ``env_source_files``.
+AGENT_ENV_FILE = "/root/.bench_agent_env"
+
+#: Where the setup script runs and where its assets land in the container;
+#: both stay outside the workspace the agent sees.
+SETUP_SCRIPT_PATH = "/opt/setup-env.sh"
+BENCH_ASSETS_DIR = "/opt/bench-assets"
+
+
+#: Root-level paths left out of the model patch: workflow records and agent
+#: config that setup scripts and agents write, not part of a solution.  A
+#: glob pathspec does not match the files under a directory it matches, so
+#: each glob also comes with ``/**``.
+PATCH_EXCLUDES = [
+    ":(exclude,glob)aidlc*",
+    ":(exclude,glob)aidlc*/**",
+    ":(exclude,glob).aidlc*",
+    ":(exclude,glob).aidlc*/**",
+    ":(exclude).claude",
+    ":(exclude)CLAUDE.md",
+    ":(exclude)AGENTS.md",
+    ":(exclude).mcp.json",
+    ":(exclude).gitignore",
+    ":(exclude)setup-env.sh",
+]
+
+#: Where the patch is written inside the container before ``docker cp``.
+CONTAINER_PATCH_FILE = "/tmp/model_patch.diff"
+
+# The workspace is owned by the host user, not by root in the container.
+_GIT = ["git", "-c", "safe.directory=*"]
+
+
+def patch_git_commands(output_path: str, base_commit: str) -> list[list[str]]:
+    """git commands that write the changes since ``base_commit`` to ``output_path``.
+
+    Run them in order in the work dir, inside the container or not.
+    ``git add -A -N`` records new files as intent-to-add, so the diff shows
+    them along with tracked edits, staged or not.  Diffing against the
+    commit the agent started from, not HEAD, keeps work it committed.
+    """
+    pathspecs = ["--", ".", *PATCH_EXCLUDES]
+    return [
+        [*_GIT, "add", "-A", "-N", *pathspecs],
+        [*_GIT, "diff", f"--output={output_path}", base_commit, *pathspecs],
+    ]
+
+
+def agent_env_script(env: Mapping[str, str]) -> str:
+    """Shell lines exporting each non-empty value of ``env``.
+
+    Values are quoted so the shell never re-parses them.  Empty values are
+    left out so they cannot override what the setup script's env files set.
+    """
+    return "".join(
+        f"export {key}={shlex.quote(str(value))}\n"
+        for key, value in env.items()
+        if value
+    )
 
 
 class DockerHarnessBase:
@@ -353,33 +425,56 @@ class DockerHarnessBase:
         self.workspace_container = container_name
         print(f"✅ Container {container_name} started with live volume sync")
 
+    def sourced_env_files(self) -> list[str]:
+        """Files sourced before each in-container command, in order.
+
+        The agent env file comes last, so its values win.
+        """
+        return [*self.env_source_files, AGENT_ENV_FILE]
+
     def _env_source_block(self) -> str:
         """Build the shell block that sources the agent env files."""
         lines = ["\n"]
-        for path in self.env_source_files:
+        for path in self.sourced_env_files():
             lines.append(f"        [ -f {path} ] && source {path}\n")
         return "".join(lines)
 
-    def execute_in_container(self, command: str, env: dict = {}) -> dict:
+    def write_agent_env(self, env: Mapping[str, str]) -> None:
+        """Replace the container's agent env file with ``env``.
+
+        The content goes over ``docker exec`` stdin, so no value is ever part
+        of a command line; the file is created with mode 0600.
+        """
+        subprocess.run(
+            [
+                "docker", "exec", "-i", self.workspace_container,
+                "bash", "-c", f"umask 077 && cat > {AGENT_ENV_FILE}",
+            ],
+            input=agent_env_script(env),
+            capture_output=True, text=True, check=True,
+        )
+
+    def execute_in_container(
+        self,
+        command: str,
+        env: Mapping[str, str] | None = None,
+        timeout: float = 3000,
+    ) -> dict:
         """Execute a command in the persistent container.
 
+        ``env``, when given, first replaces the agent env file (see
+        ``write_agent_env``), so it also applies to later commands.
+
         Returns a dict with stdout, stderr, return_code, execution_time,
-        command, and success.
+        command, and success; ``timed_out`` is set when the command ran
+        past ``timeout`` seconds.
         """
         if not self.workspace_container:
             raise RuntimeError("No persistent container available")
 
         start_time = time.time()
 
-        full_command = self._env_source_block()
-        print(f"🔧 Environment: {env}")
-        if env:
-            for key, value in env.items():
-                full_command += f"export {key}={value}\n"
-
-        print(f"🔧 Full command: {full_command}")
-
-        full_command += f"{command}"
+        full_command = self._env_source_block() + command
 
         exec_cmd = [
             "docker", "exec",
@@ -389,8 +484,10 @@ class DockerHarnessBase:
         ]
 
         try:
+            if env:
+                self.write_agent_env(env)
             result = subprocess.run(
-                exec_cmd, capture_output=True, text=True, timeout=3000
+                exec_cmd, capture_output=True, text=True, timeout=timeout
             )
             execution_time = time.time() - start_time
 
@@ -406,11 +503,12 @@ class DockerHarnessBase:
         except subprocess.TimeoutExpired:
             return {
                 "stdout": "",
-                "stderr": "Command timed out after 5 minutes",
+                "stderr": f"Command timed out after {timeout} seconds",
                 "return_code": -1,
-                "execution_time": 300,
+                "execution_time": time.time() - start_time,
                 "command": command,
                 "success": False,
+                "timed_out": True,
             }
         except Exception as e:
             return {
@@ -422,8 +520,20 @@ class DockerHarnessBase:
                 "success": False,
             }
 
-    def setup_cli_env(self, setup_script_path: str = "setup-env.sh") -> dict:
-        """Copy and run the CLI setup script inside the container."""
+    def setup_cli_env(
+        self,
+        setup_script_path: str = "setup-env.sh",
+        env: Mapping[str, str] | None = None,
+        assets_dir: str | None = None,
+    ) -> dict:
+        """Copy and run the CLI setup script inside the container.
+
+        The script may be any host path; it runs as ``SETUP_SCRIPT_PATH``,
+        outside the workspace the agent sees, with ``env`` in its
+        environment.  ``assets_dir``, when given, is copied to
+        ``BENCH_ASSETS_DIR`` first and named to the script by
+        ``BENCH_ASSETS``.
+        """
         if not self.workspace_container:
             raise RuntimeError(
                 "No persistent container available. "
@@ -432,7 +542,7 @@ class DockerHarnessBase:
 
         print(f"🔧 Setting up environment using {setup_script_path}...")
 
-        setup_file = Path("./") / setup_script_path
+        setup_file = Path(setup_script_path)
         if not setup_file.exists():
             return {
                 "stdout": "",
@@ -442,18 +552,35 @@ class DockerHarnessBase:
                 "command": f"setup from {setup_script_path}",
             }
 
+        setup_env = dict(env or {})
         try:
-            container_setup_path = (
-                f"{self.container_work_dir}/{setup_script_path}"
-            )
-
-            subprocess.run(["chmod", "+x", str(setup_file)], check=True)
+            if assets_dir:
+                copy_assets = subprocess.run(
+                    [
+                        "docker", "cp",
+                        f"{assets_dir}/.",
+                        f"{self.workspace_container}:{BENCH_ASSETS_DIR}",
+                    ],
+                    capture_output=True, text=True,
+                )
+                if copy_assets.returncode != 0:
+                    return {
+                        "stdout": "",
+                        "stderr": (
+                            "Failed to copy setup assets to container: "
+                            f"{copy_assets.stderr}"
+                        ),
+                        "return_code": copy_assets.returncode,
+                        "success": False,
+                        "command": f"copy {assets_dir} to container",
+                    }
+                setup_env["BENCH_ASSETS"] = BENCH_ASSETS_DIR
 
             copy_result = subprocess.run(
                 [
                     "docker", "cp",
                     str(setup_file),
-                    f"{self.workspace_container}:{container_setup_path}",
+                    f"{self.workspace_container}:{SETUP_SCRIPT_PATH}",
                 ],
                 capture_output=True, text=True,
             )
@@ -470,18 +597,9 @@ class DockerHarnessBase:
                     "command": f"copy {setup_script_path} to container",
                 }
 
-            chmod_result = self.execute_in_container(
-                f"chmod +x {container_setup_path}"
-            )
-            if not chmod_result["success"]:
-                print(
-                    "⚠️  Warning: Could not make script executable: "
-                    f"{chmod_result['stderr']}"
-                )
-
             print("🚀 Running setup script...")
             setup_result = self.execute_in_container(
-                f"bash {container_setup_path}"
+                f"bash {SETUP_SCRIPT_PATH}", env=setup_env
             )
 
             if setup_result["success"]:
@@ -507,20 +625,6 @@ class DockerHarnessBase:
 
             return setup_result
 
-        except subprocess.CalledProcessError as e:
-            error_msg = (
-                "Docker command failed: "
-                f"{e.stderr if hasattr(e, 'stderr') else str(e)}"
-            )
-            print(f"❌ {error_msg}")
-            return {
-                "stdout": e.stdout if hasattr(e, "stdout") else "",
-                "stderr": error_msg,
-                "return_code": e.returncode,
-                "success": False,
-                "command": f"setup from {setup_script_path}",
-                "execution_time": 0,
-            }
         except Exception as e:
             error_msg = f"Setup failed: {str(e)}"
             print(f"❌ {error_msg}")
@@ -532,6 +636,63 @@ class DockerHarnessBase:
                 "command": f"setup from {setup_script_path}",
                 "execution_time": 0,
             }
+
+    def stop_agent_processes(self) -> None:
+        """Kill every process left in the container except PID 1.
+
+        Killing a timed-out ``docker exec`` leaves its process running in
+        the container; stop it before taking the patch, so nothing still
+        edits the workspace or holds git's index lock.
+        """
+        subprocess.run(
+            [
+                "docker", "exec", self.workspace_container,
+                "bash", "-c", "kill -KILL -1",
+            ],
+            capture_output=True,
+        )
+
+    def head_commit(self) -> str:
+        """The commit the workspace is at, read inside the container."""
+        result = subprocess.run(
+            [
+                "docker", "exec",
+                "-w", self.container_work_dir,
+                self.workspace_container,
+                *_GIT, "rev-parse", "HEAD",
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        return result.stdout.strip()
+
+    def extract_patch(self, base_commit: str = "HEAD") -> str:
+        """The diff since ``base_commit``, new files included, taken inside
+        the container.
+
+        Pass the ``head_commit()`` read before the agent ran to keep what
+        it committed.  Paths in ``PATCH_EXCLUDES`` are left out.
+        """
+        for git_command in patch_git_commands(CONTAINER_PATCH_FILE, base_commit):
+            subprocess.run(
+                [
+                    "docker", "exec",
+                    "-w", self.container_work_dir,
+                    self.workspace_container,
+                    *git_command,
+                ],
+                capture_output=True, text=True, check=True,
+            )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_patch = Path(tmp_dir) / "model_patch.diff"
+            subprocess.run(
+                [
+                    "docker", "cp",
+                    f"{self.workspace_container}:{CONTAINER_PATCH_FILE}",
+                    str(local_patch),
+                ],
+                capture_output=True, text=True, check=True,
+            )
+            return local_patch.read_text(encoding="utf-8")
 
     def cleanup(self):
         """Stop and remove the container; optionally preserve the workspace."""

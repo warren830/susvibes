@@ -7,18 +7,17 @@ with Docker-based Claude execution, and saves the git diff results to JSON files
 """
 
 import json
-import os
 import subprocess
 import asyncio
 import time
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 import argparse
 import shlex
 
 # Import the Docker integration classes
-from run_docker import DockerIntegration, USER_PROMPT_TEMPLATE, ALLOWED_TOOLS
+from run_docker import DockerIntegration, USER_PROMPT_TEMPLATE, ALLOWED_TOOLS, DISALLOWED_TOOLS, claude_tool_flags, get_agent_env
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -35,6 +34,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+#: Seconds an agent driver gets past --timeout to stop the agent and write its files.
+DRIVER_GRACE_SECONDS = 300
+
 def get_options():
     parser = argparse.ArgumentParser(description='Process multiple tasks with Docker-based Claude execution')
     parser.add_argument('--jsonl_file', type=str, default='../datasets/susvibes_dataset.jsonl', help='Path to the JSONL file')
@@ -45,6 +47,12 @@ def get_options():
     parser.add_argument('--load_from_file', type=str, default=None, help='Path to the file to load from')
     parser.add_argument('--model', type=str, default="claude", help='Model to use')
     parser.add_argument('--setup_script', type=str, default="setup-env.sh", help='Setup script to run in container')
+    parser.add_argument('--setup_assets', type=str, default=None, help='Host directory copied to /opt/bench-assets in the container before the setup script runs; the script sees it as BENCH_ASSETS')
+    parser.add_argument('--claude_code_version', type=str, default=None, help="Claude Code version the setup script installs, passed to it as CLAUDE_CODE_VERSION (default: the script's own)")
+    parser.add_argument('--allowed_tools', type=str, default=','.join(ALLOWED_TOOLS), help='Comma-separated tools Claude may use without asking')
+    parser.add_argument('--disallowed_tools', type=str, default=','.join(DISALLOWED_TOOLS), help='Comma-separated tools Claude may not use')
+    parser.add_argument('--timeout', type=int, default=3000, help='Seconds the agent may run on one instance')
+    parser.add_argument('--agent_driver', type=str, default=None, help='Host executable that runs the agent step instead of claude -p (see README.md)')
     parser.add_argument('--timestamp_suffix', type=str, default=None, help='Suffix to append to timestamp for unique directory names (for parallel runs)')
     parser.add_argument('--keep_workspace', action='store_true', default=False, help='Whether to keep the workspace after cleanup')
     parser.add_argument('--strategy', type=str, default='none', choices=['none', 'generic'],
@@ -52,23 +60,66 @@ def get_options():
     return parser
 
 
-def simple_git_diff(dirpath: str) -> str:
+def split_tools(value: str) -> List[str]:
+    """Tool names from a comma-separated option value."""
+    return [tool.strip() for tool in value.split(',') if tool.strip()]
+
+
+def run_agent_driver(
+    integration: DockerIntegration,
+    agent_driver: str,
+    prompt: str,
+    artifacts_dir: Path,
+    timeout: int,
+    allowed_tools: List[str],
+    disallowed_tools: List[str],
+) -> Dict[str, Any]:
     """
-    Get git diff from the specified directory.
-    
-    Args:
-        dirpath: Path to the directory to get git diff from
-        
+    Run the agent step through a host-side driver instead of claude -p.
+
+    The driver reads the prompt from a file in artifacts_dir and writes
+    raw.jsonl (the CLI's stream-json output) and summary.json there.
+
     Returns:
-        Git diff output as string
+        The keys execute_in_container returns, plus agent_summary
     """
-    original_cwd = os.getcwd()
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    prompt_file = artifacts_dir / "prompt.txt"
+    prompt_file.write_text(prompt, encoding="utf-8")
+    cmd = [
+        agent_driver,
+        "--container", integration.workspace_container,
+        "--workdir", integration.container_work_dir,
+        "--prompt-file", str(prompt_file),
+        "--out-dir", str(artifacts_dir),
+        "--timeout", str(timeout),
+        "--allowed-tools", ",".join(allowed_tools),
+        "--disallowed-tools", ",".join(disallowed_tools),
+    ]
+    for env_file in integration.sourced_env_files():
+        cmd += ["--source", env_file]
+
+    start_time = time.time()
     try:
-        os.chdir(dirpath)
-        result = subprocess.run(['git', 'diff'], capture_output=True, text=True)
-        return result.stdout
-    finally:
-        os.chdir(original_cwd)
+        driver = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, timeout=timeout + DRIVER_GRACE_SECONDS)
+        return_code, stderr, driver_timed_out = driver.returncode, driver.stderr, False
+    except subprocess.TimeoutExpired:
+        return_code, driver_timed_out = -1, True
+        stderr = f"Agent driver timed out after {timeout + DRIVER_GRACE_SECONDS} seconds"
+
+    raw_file = artifacts_dir / "raw.jsonl"
+    summary_file = artifacts_dir / "summary.json"
+    summary = json.loads(summary_file.read_text(encoding="utf-8")) if summary_file.exists() else None
+    status = summary.get("status") if summary else None
+    return {
+        "stdout": raw_file.read_text(encoding="utf-8") if raw_file.exists() else "",
+        "stderr": stderr,
+        "return_code": return_code,
+        "execution_time": time.time() - start_time,
+        "success": return_code == 0 and status == "completed",
+        "timed_out": driver_timed_out or status == "timeout",
+        "agent_summary": summary,
+    }
 
 
 def load_instances(jsonl_file: str) -> List[Dict[str, Any]]:
@@ -103,10 +154,26 @@ def load_instances(jsonl_file: str) -> List[Dict[str, Any]]:
         return []
 
 
-async def process_instance(instance: Dict[str, Any], index: int, total: int, model: str, workspace_root: str = ".", setup_script: str = "setup-env.sh", keep_workspace: bool = True, strategy: str = "none") -> Dict[str, Any]:
+async def process_instance(
+    instance: Dict[str, Any],
+    index: int,
+    total: int,
+    model: str,
+    workspace_root: str = ".",
+    setup_script: str = "setup-env.sh",
+    keep_workspace: bool = True,
+    strategy: str = "none",
+    setup_assets: Optional[str] = None,
+    claude_code_version: Optional[str] = None,
+    allowed_tools: List[str] = ALLOWED_TOOLS,
+    disallowed_tools: List[str] = DISALLOWED_TOOLS,
+    timeout: int = 3000,
+    agent_driver: Optional[str] = None,
+    artifacts_root: str = "artifacts",
+) -> Dict[str, Any]:
     """
     Process a single instance with Docker-based Claude execution.
-    
+
     Args:
         instance: Instance dictionary from JSONL
         index: Current instance index (0-based)
@@ -114,7 +181,14 @@ async def process_instance(instance: Dict[str, Any], index: int, total: int, mod
         model: Model name
         workspace_root: Root directory for workspaces
         setup_script: Setup script to run in container
-        
+        setup_assets: Host directory the setup script gets as BENCH_ASSETS
+        claude_code_version: Claude Code version the setup script installs
+        allowed_tools: Tools Claude may use without asking
+        disallowed_tools: Tools Claude may not use
+        timeout: Seconds the agent may run
+        agent_driver: Host executable that runs the agent step instead of claude -p
+        artifacts_root: Directory holding each instance's driver artifacts
+
     Returns:
         Result dictionary with instance_id, model, and model_patch
     """
@@ -147,13 +221,7 @@ async def process_instance(instance: Dict[str, Any], index: int, total: int, mod
         # Set up Docker integration
         logger.info(f"Starting Docker integration for {instance_id}")
         
-        env = {}
-        env["ANTHROPIC_MODEL"] = os.environ.get("ANTHROPIC_MODEL", "")
-        env["ANTHROPIC_BASE_URL"] = os.environ.get("ANTHROPIC_BASE_URL", "")
-        env["ANTHROPIC_AUTH_TOKEN"] = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
-        env["ANTHROPIC_API_KEY"] = os.environ.get("ANTHROPIC_API_KEY", "")
-        env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS", 50000)
-        print(f"🔧 Environment: {env}")
+        env = get_agent_env()
         
         if strategy != "none":
             problem_statement = apply_safety_hint(problem_statement)
@@ -168,21 +236,35 @@ async def process_instance(instance: Dict[str, Any], index: int, total: int, mod
             print(f"🔧 Setting up environment...")
             workspace = integration.setup_persistent_workspace()
 
-            setup_result = integration.setup_cli_env(setup_script_path=setup_script)
+            setup_env = {"CLAUDE_CODE_VERSION": claude_code_version} if claude_code_version else {}
+            setup_result = integration.setup_cli_env(setup_script_path=setup_script, env=setup_env, assets_dir=setup_assets)
 
-            # Set up environment
+            # Going on would run the agent on a half-installed setup, silently measuring another configuration
             if not setup_result["success"]:
-                logger.warning(f"Environment setup failed for {instance_id}: {setup_result['stderr']}")
-            
-            
+                logger.error(f"Environment setup failed for {instance_id}: {setup_result['stderr']}")
+                return {
+                    "instance_id": instance_id,
+                    "model_name_or_path": model,
+                    "model_patch": "",
+                    "error": f"Environment setup failed: {setup_result['stderr']}",
+                    "workspace": str(workspace)
+                }
+
+            base_commit = integration.head_commit()
+            integration.write_agent_env(env)
+
             # Run Claude with the problem statement
             logger.info(f"Running Claude for {instance_id}")
-            claude_command = (
-                "claude --verbose --output-format stream-json "
-                f"-p {escaped_instruction} --allowedTools {' '.join(ALLOWED_TOOLS)}"
-            )
-            
-            result = integration.execute_in_container(claude_command, env=env)
+            if agent_driver:
+                artifacts_dir = Path(artifacts_root, instance_id).resolve()
+                result = run_agent_driver(integration, agent_driver, prompt, artifacts_dir, timeout, allowed_tools, disallowed_tools)
+            else:
+                tool_flags = claude_tool_flags(allowed_tools, disallowed_tools)
+                claude_command = (
+                    "claude --verbose --output-format stream-json "
+                    f"-p {escaped_instruction} {tool_flags}"
+                )
+                result = integration.execute_in_container(claude_command, timeout=timeout)
             
             if result["success"]:
                 logger.info(f"Claude execution completed successfully for {instance_id}")
@@ -195,7 +277,8 @@ async def process_instance(instance: Dict[str, Any], index: int, total: int, mod
             print(f"📁 Your improved code is at: {workspace}")
             
             # Get git diff
-            diff_text = simple_git_diff(str(workspace))
+            integration.stop_agent_processes()
+            diff_text = integration.extract_patch(base_commit)
             
             result_dict = {
                 "instance_id": instance_id,
@@ -204,8 +287,12 @@ async def process_instance(instance: Dict[str, Any], index: int, total: int, mod
                 "workspace": str(workspace),
                 "claude_stdout": result.get("stdout", ""),
                 "claude_stderr": result.get("stderr", ""),
-                "claude_success": result.get("success", False)
+                "claude_success": result.get("success", False),
+                "timed_out": result.get("timed_out", False)
             }
+            if agent_driver:
+                result_dict["agent_summary"] = result["agent_summary"]
+                result_dict["artifacts_dir"] = str(artifacts_dir)
             
             # Clean up the integration
             integration.cleanup()
@@ -273,6 +360,13 @@ async def main(args):
                 workspace_root=workspace_root, setup_script=setup_script,
                 keep_workspace=args.keep_workspace,
                 strategy=args.strategy,
+                setup_assets=args.setup_assets,
+                claude_code_version=args.claude_code_version,
+                allowed_tools=split_tools(args.allowed_tools),
+                disallowed_tools=split_tools(args.disallowed_tools),
+                timeout=args.timeout,
+                agent_driver=args.agent_driver,
+                artifacts_root=str(results_dir / "artifacts"),
             )
             
             # Save intermediate results every instance

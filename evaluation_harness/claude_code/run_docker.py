@@ -4,6 +4,7 @@ import os
 import shlex
 import sys
 from pathlib import Path
+from typing import Mapping
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,7 +29,58 @@ ALLOWED_TOOLS = [
     "TodoRead",
     "TodoWrite",
     "Agent",
+    "Skill",
+    "Task",
+    "mcp__security-agent__*",
 ]
+
+#: The Security Agent's setup tool creates AWS resources, which no run may do.
+DISALLOWED_TOOLS = [
+    "mcp__security-agent__setup",
+]
+
+#: Host env vars passed to the agent; names listed in BENCH_FORWARD_ENV
+#: (comma-separated) are passed too.
+AGENT_ENV_NAMES = [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "AWS_REGION",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK",
+]
+
+
+def get_agent_env(environ: Mapping[str, str] = os.environ) -> dict[str, str]:
+    """The agent's env: each forwarded host var that is set and non-empty.
+
+    An unset var stays unset in the container, so it cannot override the
+    value the setup script wrote (e.g. ANTHROPIC_MODEL in /root/.claude_env).
+    """
+    extra = [name.strip() for name in environ.get("BENCH_FORWARD_ENV", "").split(",")]
+    env = {name: environ[name] for name in [*AGENT_ENV_NAMES, *extra] if environ.get(name)}
+    env.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "50000")
+    return env
+
+
+def claude_tool_flags(allowed_tools: list[str], disallowed_tools: list[str]) -> str:
+    """The ``--allowedTools`` and ``--disallowedTools`` arguments, each tool shell-quoted."""
+    flags = []
+    if allowed_tools:
+        flags.append("--allowedTools " + " ".join(map(shlex.quote, allowed_tools)))
+    if disallowed_tools:
+        flags.append("--disallowedTools " + " ".join(map(shlex.quote, disallowed_tools)))
+    return " ".join(flags)
 
 
 class DockerIntegration(DockerHarnessBase):
@@ -53,14 +105,6 @@ def main():
     TASK = instance["problem_statement"]
     DOCKER_IMAGE = instance["image_name"]
 
-    env = {}
-    env["ANTHROPIC_MODEL"] = os.environ.get("ANTHROPIC_MODEL", "")
-    env["ANTHROPIC_BASE_URL"] = os.environ.get("ANTHROPIC_BASE_URL", "")
-    env["ANTHROPIC_AUTH_TOKEN"] = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
-    env["ANTHROPIC_API_KEY"] = os.environ.get("ANTHROPIC_API_KEY", "")
-    env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS", 50000)
-    print(f"🔧 Environment: {env}")
-
     prompt = USER_PROMPT_TEMPLATE.format(local_work_dir="/project", problem_statement=TASK)
     escaped_instruction = shlex.quote(prompt)
 
@@ -77,10 +121,10 @@ def main():
         print(f"🔧 Task: {TASK}")
         claude_command = (
             "claude --verbose --output-format stream-json "
-            f"-p {escaped_instruction} --allowedTools {' '.join(ALLOWED_TOOLS)}"
+            f"-p {escaped_instruction} {claude_tool_flags(ALLOWED_TOOLS, DISALLOWED_TOOLS)}"
         )
 
-        result = integration.execute_in_container(claude_command, env=env)
+        result = integration.execute_in_container(claude_command, env=get_agent_env())
         print(f"🔧 Result: {result}")
 
         print(f"\n🎉 Session complete!")
